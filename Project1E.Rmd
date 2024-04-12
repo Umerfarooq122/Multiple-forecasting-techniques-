@@ -1,0 +1,1041 @@
+---
+title: "Forecating ATM, Residential Power and Waterflow"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+library(tidyverse)
+library(forecast)
+library(readxl)
+library(httr)
+library(fpp3)
+library(fabletools)
+library(lubridate)
+library(mice)
+library(fable)
+library(imputeTS)
+```
+
+
+## **Forecasting ATM, Residential Power and Water Flow:** 
+
+This Forecasting project comprises of multiple time series from ATM cash flow, residential power to water flow. The study below has dealt with each of the time series separately and attempted to create a separate forecasting model for each. Before creating the models the all of the time series did posses some challenges when comes to preparing and cleaning the data set. Once the data was ready, the models were trained to produce forecast. The selection of models was carried out by looking at multiple factors like the characteristics of time series, model metrics like AICc and RMSE e.t.c. Before any further due lets start working with out time series. The tabs below can let you toggle among all the three series.
+
+## **ATM Forecast:**
+
+In the ATM forecast we are suppose to forecast for the month of May in 2010. The time series provided in a single file that contains all the series of ATMs i.e. all four ATMs. Let's load the time series and start working on it. 
+
+### **Loading the Dataset:**
+
+I have stored the time series in github repository from where I can read the file directly into  my rmarkdown. This ensures the reproducibility.
+
+```{r warning=FALSE, message=FALSE}
+atm <- read_csv("https://raw.githubusercontent.com/Umerfarooq122/Multiple-forecasting-techniques-/main/atm%20-%20ATM%20Data.csv")
+head(atm)
+```
+
+We have loaded the time series into our frame work but the time series in the form of data frame rather than a tsibble object. We can see that the `DATE` column from our time series has numbers rather than proper that so we have to convert that into Date too. So before converting our time series from data frame type to tsibble let's fix theses problems. 
+
+```{r warning=FALSE, message=FALSE}
+atm_ts <- atm|>
+  mutate(DATE = as.Date(DATE, origin = "1899-12-30")) %>%
+  # renaming column name
+  rename(Date = DATE) %>%
+  #selecting from May 2009 to April 2010
+  filter(Date < "2010-05-01")
+
+head(atm_ts)
+```
+
+As we can see that our time series which is  still a data frame object has a proper date column now courtesy of `as.Date()` function.
+Now let's check if we have any missing values in our time series
+
+```{r}
+colSums(is.na(atm_ts))
+```
+
+We can confirm that our time series has 5 missing values in Cash column so before modeling let's fix that first.
+
+### **Handling Missing Data:**
+
+Since our ATM time series has four different ATMs information so let's see which ATM is missing these values.
+
+```{r}
+atm_ts %>% 
+  as.data.frame() %>%
+  group_by(ATM) %>%
+  summarise(`Missing Values` = sum(is.na(Cash)))
+```
+
+
+There are three missing values for ATM1 and two for ATM2. To address these five missing values, we applied an ARIMA model to the dataset with the missing values and used it to interpolate the absent observations. We also did try other techniques like predictive mean matching `pmm` and Random Forest `rf` from mice package but we got results that were creating outliers in our time series. Before interpolating for missing values using ARIMA we have to convert our series to a tsibble object.
+
+```{r}
+atm_ts <- as_tsibble(atm_ts, index = Date, key = ATM)
+```
+
+Now that we have got the tsibble object we can go ahead and interpolate for missing values.
+
+```{r}
+atm_ts <- atm_ts %>%
+  # Fit ARIMA model to the data containing missing values
+  model(ARIMA(Cash)) %>%
+  # Estimate Cash for the missing values.
+  interpolate(atm_ts)
+
+```
+
+Now that our missing values are fix let's check out our ATM time series.
+
+### **Exploring the Time Series:**
+
+At initial inspection, there seems to be some seasonality in ATM1 and ATM2, whereas ATM3 appears to have been active primarily towards the end of April 2010. Additionally, there is a notable outlier in ATM4. It would be prudent to eliminate this outlier and conduct a more in-depth exploration of the data.
+
+```{r}
+atm_ts|>
+  ggplot2::autoplot(Cash) +
+  facet_wrap(~ATM, scales = "free", nrow = 4) +
+  labs(title = " ATM Before Outlier Removal")
+```
+
+### **Creating Predictive Model and Forecast for Each ATM:** 
+
+Since ATM time series has four different time series so we will handle and model one at a time. The tabs below allows you to toggle among the time series for all the four ATMs.
+
+#### ATM 1:
+
+In this section we will look at the ATM1 Cash which is in hundreds of dollars. Let's plot our time series to see if there any room for transformation or not.
+
+##### **Exploring and Fixing Series**
+
+```{r}
+#plot
+atm_ts %>%
+  filter(ATM == "ATM1") %>%
+  autoplot(Cash) +
+  ggtitle("Non-tranformed ATM1")
+```
+
+We can visually inspect that there is minute difference among the variance as we go from start till the end So I guess a transformation will be helpful. Let's get the lambda for our box_cox transformation and then plot the transformed time series 
+
+```{r}
+lambda <- atm_ts %>%
+  filter(ATM == "ATM1") %>%
+  features(Cash, features = guerrero) %>%
+  pull(lambda_guerrero)
+```
+
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM1") %>%
+  autoplot(box_cox(Cash, lambda)) +
+  ggtitle("Transformed ATM1")
+```
+
+We can visually confirm that there is more uniformity in the time series after transformation. Now we will decompose the time series to see what we are dealing with.
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM1") %>%
+  model(STL(box_cox(Cash, lambda) ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition for ATM1")
+```
+
+##### **Modeling:**
+
+we can see that there is no clear trend in the series but we do have the seasonality so we can definitely use seasonal naive model. Alongside that we can apply Error Trend and Seasonality (ETS) models like ANA and MNM.  Seasonal ARIMA model is another option that we can use. Below we have tried a bunch of models and based of AICc we will chose one. We did use both transformed and non-transformed time series. The models used were Auto ARIMA, SNaive, ETS(ANA), ETS (MNM).
+
+```{r}
+atm1_fit <- atm_ts %>%
+  filter(ATM == "ATM1") %>%
+  model(
+    # additive ETS model
+    additive = ETS(Cash ~ error("A") + trend("N") + season("A")),
+    # multiplicative ETS model
+    multiplicative = ETS(Cash ~ error("M") + trend("N") + season("M")),
+    # SNAIVE model
+    snaive = SNAIVE(Cash),
+    # transformed additive ETS model
+    additive_ts = ETS(Cash ~ error("A") + trend("N") + season("A")),
+    # transformed multiplicative ETS model
+    multiplicative_ts = ETS(Cash ~ error("M") + trend("N") + season("M")),
+    # transformed SNAIVE model
+    snaive_ts = SNAIVE(box_cox(Cash,lambda)),
+    # arima model
+    ARIMA = ARIMA(Cash),
+    ARIMA_ts = ARIMA(box_cox(Cash, lambda), stepwise = FALSE)
+  )
+```
+
+```{r}
+left_join(glance(atm1_fit) %>% select(.model:BIC), 
+          accuracy(atm1_fit) %>% select(.model, RMSE)) %>%
+  arrange(AICc)
+```
+
+As we can see that the ARIMA performs better in terms of model complexity and goodness of fit since it has the lowest AICc values. We will use ARIMA with trasnformed time series and create forecast but before that we can check the report on our model
+
+```{r warning=FALSE}
+atm1_fit %>% select(.model = "ARIMA_ts") %>% report()
+```
+
+As we can see that the Auto ARIMA function in fabletools picked a model of ARIMA (0,0,2)(0,1,1). The Autoregressive part on both seasonal and non seasonal is 0. Now let's see if we can find an improvement over this ARIMA which is automatically picked by R. Here is the unit root test to check if our time series requires any differencing.
+
+```{r}
+atm_ts |>
+  mutate(log_prod = difference(box_cox(Cash,lambda), 7)) |>
+  features(log_prod, unitroot_ndiffs)
+```
+
+Now we will look at the ACF/PACF plots. We can manually create AR and MA models from PACF and ACF plot, respectively.
+
+```{r warning=FALSE}
+atm_ts |>
+  filter(ATM=='ATM1')|>
+  gg_tsdisplay(difference(box_cox(Cash, lambda), 7),
+               plot_type='partial', lag=30) +
+  labs(title="Seasonally differenced", y="")
+```
+
+We can see that on the ACF side we have one significant spike on lag 7 which is season 1 and on non seasonal side we have a spike at lag 6. This suggest a model of q = 6 and Q = 1, seasonal difference, D = 1 and both p and P is zero. After creating this MA model we can create and AR by following the same strategy on PACF plot.
+
+```{r}
+fit <- atm_ts |>
+  filter(ATM == "ATM1") %>%
+  model(arima006011 = ARIMA(box_cox(Cash,lambda) ~ 0 + pdq(0,0,6)+PDQ(0,1,1)),
+        arima600410 = ARIMA(box_cox(Cash,lambda)  ~ 0 + pdq(6,0,0)+PDQ(4,1,0)),
+        arima102112 = ARIMA(box_cox(Cash,lambda) ~ 0 + pdq(1,0,2)+PDQ(1,1,2)),
+        arima003111 = ARIMA(box_cox(Cash,lambda)  ~ 0 + pdq(0,0,3)+PDQ(1,1,1)),
+        auto = ARIMA(box_cox(Cash,lambda), stepwise = FALSE))
+```
+
+
+```{r}
+left_join(glance(fit) %>% select(.model:BIC), 
+          accuracy(fit) %>% select(.model, RMSE)) %>%
+  arrange(AICc)
+```
+
+
+##### **Forecasting:**
+
+As we can see that the model we picked manually from ACF/PACF plots did not out perform the auto models selected by R so we will go with that model. We can forecast for the next 31 values since May is month of 31 days
+
+
+```{r}
+# forecasting
+fc_atm1 <- atm1_fit %>%
+  forecast(h = 31) %>%
+  filter(.model=='ARIMA_ts')
+```
+
+Now that our forecast is ready so we can go ahead and plot the forecast to visually inspect how the model performed.
+
+```{r}
+# forcasted plot
+fc_atm1 %>%
+  autoplot(atm_ts) +
+  ggtitle(latex2exp::TeX(paste0("ATM 1 Forcasted with $ARIMA(0,0,2)(0,1,1)_7$ and $\\lambda$ = ",
+         round(lambda,2))))
+```
+
+Let's check out the residuals and see if it is white noise or did our model miss some information uncaptured.
+
+```{r}
+# residuals
+atm1_fit %>%
+  select(ARIMA_ts) %>%
+  gg_tsresiduals() +
+  ggtitle(latex2exp::TeX(paste0("Residuals for $ARIMA(0,0,2)(0,1,1)_7$ with $\\lambda$ = ",
+         round(lambda,2))))
+```
+
+The residuals looks fine and seems like its just white noise and ACF plot shows that the model captured most of the information from the data. Below is the ljung_box test which again confirms adequacy of the model.
+
+```{r}
+augment(atm1_fit) |>
+  filter(.model == "ARIMA_ts") |>
+  features(.innov, ljung_box, lag=36, dof = 3)
+```
+
+Since the P-value is over .05 so we can not reject the null hypothesis which is there is no autocorrelation present in the time series.
+
+#### **ATM 2:**
+
+In this section we will look at the ATM 2 from our ATM time series. Here is a quick plot of the time series.
+
+##### **Exploring And Fixing Series**
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM2") %>%
+  autoplot(Cash) +
+  ggtitle("Non-tranformed ATM2")
+```
+
+We can visually confirm that the time series does require some kind of transformation to bring some uniformity to the variance of the seasonality. Here is the lambda value for box_cox transformation.
+
+```{r}
+lambda2 <- atm_ts %>%
+  filter(ATM == "ATM2") %>%
+  features(Cash, features = guerrero) %>%
+  pull(lambda_guerrero)
+```
+
+Let's plot the transformed time series.
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM2") %>%
+  autoplot(box_cox(Cash,lambda2)) +
+  ggtitle("Transformed ATM2")
+```
+
+We can see that the time series look much more uniform now. We can go ahead and look at the decomposed time series to have a better understanding of all the components of the series.
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM2") %>%
+  model(STL(box_cox(Cash, lambda2) ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition for ATM2")
+```
+
+
+##### **Modeling:**
+
+Again just like ATM 1, the ATM 2 also has no trend but has seasonality so we try models like Auto ARIMA, SNaive, ETS(ANA), ETS (MNM).
+
+```{r}
+atm2_fit <- atm_ts %>%
+  filter(ATM == "ATM2") %>%
+  model(
+    # additive ETS model
+    additive = ETS(Cash ~ error("A") + trend("N") + season("A")),
+    # multiplicative ETS model
+    multiplicative = ETS(Cash ~ error("M") + trend("N") + season("M")),
+    # SNAIVE model
+    snaive = SNAIVE(Cash),
+    # transformed additive ETS model
+    additive_ts = ETS(box_cox(Cash,lambda2) ~ error("A") + trend("N") + season("A")),
+    # transformed multiplicative ETS model
+    multiplicative_ts = ETS(box_cox(Cash,lambda2) ~ error("M") + trend("N") + season("M")),
+    # transformed SNAIVE model
+    snaive_ts = SNAIVE(box_cox(Cash,lambda2)),
+    ARIMA = ARIMA(Cash),
+    # arima model
+    ARIMA_ts = ARIMA(box_cox(Cash,lambda2))
+  )
+```
+
+```{r}
+left_join(glance(atm2_fit) %>% select(.model:BIC), 
+          accuracy(atm2_fit) %>% select(.model, RMSE)) %>%
+  arrange(RMSE)
+```
+
+Again the ARIMA outperforms other techniques which comes to AICc values so we will choose ARIMA with transformed data. Here is our model report
+
+```{r}
+atm2_fit %>% select(.model = "ARIMA_ts") %>% report()
+```
+
+
+##### **Forecasting:**
+
+Now that our model is ready let's go ahead and produce forecast for the  month of May. 
+
+```{r}
+fc_atm2 <- atm2_fit %>%
+  forecast(h = 31) %>%
+  filter(.model=='ARIMA_ts')
+```
+
+The forecasted values are ready and let's plot them.
+
+```{r}
+fc_atm2 %>%
+  autoplot(atm_ts) +
+  ggtitle(latex2exp::TeX(paste0("ATM 2 Forcasted with $ARIMA(2,0,2)(0,1,1)_7$ and $\\lambda$ = ",
+         round(lambda,2))))
+
+```
+
+The plot does look okay and now let's check out the residuals and Ljung_box test/
+
+```{r}
+atm2_fit %>%
+  select(ARIMA_ts) %>%
+  gg_tsresiduals() +
+  ggtitle(latex2exp::TeX(paste0("Residuals for $ARIMA(2,0,2)(0,1,1)_7$ with $\\lambda$ = ",
+         round(lambda,2))))
+```
+
+The residual again shows white noise only. 
+
+```{r}
+augment(atm2_fit) |>
+  filter(.model == "ARIMA_ts") |>
+  features(.innov, ljung_box, lag=36, dof=5)
+```
+
+According to the P-value again we reject the null hypothesis and conclude that there is no evidence of autocorrelation in the data.
+
+#### **ATM 3:**
+
+ATM 3 is a bit different since all of the values are zero apart from last three values. We you could attempt to fit an ARIMA model to three data points, but it would be highly unreliable and not recommended. ARIMA models require a sufficient amount of data to estimate the parameters accurately and to make meaningful forecasts. Similarly for ETS models also require a sufficient amount of data to estimate the parameters accurately and make reliable forecasts. With only three data points, it would still be challenging to build a robust ETS model. If we look at some benchmark techniques we can use Mean, Naive, Seasonal Naive and drift. Out of all these I would pick mean and apply it to the time series but considering only last three values. Let's have a quick look at the plot
+
+##### **Exploring the Series:**
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM3") %>%
+  autoplot(Cash) +
+  ggtitle("Non-tranformed ATM3")
+```
+
+Now let's create a model with last three values using Mean.
+
+##### **Modeling:**
+
+```{r}
+atm3_fit <- atm_ts %>%
+  filter(ATM == "ATM3",
+         Cash != 0) %>%
+  model(MEAN(Cash))
+
+```
+
+Our model is ready and we can forecast for the month of May.
+
+##### **Forecasting:**
+
+```{r}
+fc_atm3 <- atm3_fit %>%
+  forecast(h = 31) 
+```
+
+Here is a plot of our forecast.
+
+```{r}
+fc_atm3 %>%
+  autoplot(atm_ts) +
+  ggtitle("ATM 3 Forecasted with the MEAN() Model")
+```
+
+#### **ATM 4:**
+
+In this section we wil look at ATM 4 from our ATM time series. Here is a quick plot of our time series.
+
+##### **Exploring the Series:**
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  autoplot(Cash) +
+  ggtitle("Non-tranformed ATM4")
+
+dcmp_4 <- atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  model(STL(Cash ~ season(window = "periodic"), robust = TRUE)) %>%
+  components()
+```
+
+In ATM4, there's a conspicuous outlier that should be excluded before forecasting the data. Subsequently, we can utilize interpolation to fill in the gap caused by its removal. Applying a criterion where outliers surpass 3 interquartile ranges, we've identified two such outliers in the dataset. Below we identify the outliers 
+
+##### **Handling The Outliers:**
+
+```{r}
+outliers <- dcmp_4 %>%
+  filter(remainder < quantile(remainder, 0.25) - 3*IQR(remainder) |
+           remainder > quantile(remainder, 0.75) + 3*IQR(remainder))
+outliers
+```
+
+Now that the outlier is Identified we can go ahead and replace them with NA and then interpolate for it using ARIMA. We can see that the outlier on February 9 is much larger as compare to the September 22 so we will replace only the former one.
+
+
+```{r}
+ATM_miss <- atm_ts %>%
+  #replace outliers
+  mutate(Cash = replace(Cash, ATM == "ATM4" & Date == "2010-02-09", NA)) 
+  
+atm_ts <- ATM_miss %>%
+  # Fit ARIMA model to the data with missing values
+  model(ARIMA(Cash)) %>%
+  # Estimate Cash for the missing values / outliers
+  interpolate(ATM_miss)
+```
+
+Our outliers are fixed and now we can check the plot of time series alongside the components of our time series. 
+
+```{r}
+atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  autoplot(Cash) +
+  ggtitle("ATM4 with No Outlier")
+
+# STL decomposition
+atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  model(STL(Cash ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition for ATM4 with No Outlier")
+```
+
+It looks like our time series does require some transformation. Again we can confirm that our time series has no trend but it has weekly seasonality. We can tray the some models that we did for ATM 1 and 2 but before that we have to transform our time series.
+
+##### **Modeling:**
+
+```{r}
+lambda4 <- atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  features(Cash, features = guerrero) %>%
+  pull(lambda_guerrero)
+```
+
+We got the lambda for transformation and now we can create models.
+
+```{r}
+atm4_fit <- atm_ts %>%
+  filter(ATM == "ATM4") %>%
+  model(
+    # additive ETS model
+    additive = ETS(Cash ~ error("A") + trend("N") + season("A")),
+    # multiplicative ETS model
+    multiplicative = ETS(Cash ~ error("M") + trend("N") + season("M")),
+    # SNAIVE model
+    snaive = SNAIVE(Cash),
+    # transformed additive ETS model
+    additive_ts = ETS(box_cox(Cash,lambda4) ~ error("A") + trend("N") + season("A")),
+    # transformed multiplicative ETS model
+    multiplicative_ts = ETS(box_cox(Cash,lambda4) ~ error("M") + trend("N") + season("M")),
+    # transformed SNAIVE model
+    snaive_ts = SNAIVE(box_cox(Cash,lambda4)),
+    # arima model
+    ARIMA_ts = ARIMA(box_cox(Cash,lambda4)),
+    ARIMA = ARIMA(Cash),
+     # transformed additive ETS model, no seasonality
+    additive_ts_no_s = ETS(box_cox(Cash,lambda) ~ error("A") + trend("N") + season("N")),
+    # transformed multiplicative ETS model, no seasonality
+    multiplicative_ts_no_s = ETS(box_cox(Cash,lambda) ~ error("M") + trend("N") + season("N"))
+  )
+```
+
+Let's check the model metrics
+
+```{r}
+left_join(glance(atm4_fit) %>% select(.model:BIC), 
+          accuracy(atm4_fit) %>% select(.model, RMSE)) %>%
+  arrange(AICc)
+```
+
+ETS() models lacking seasonality performed less favorably compared to those incorporating seasonality. While the Additive ETS() model exhibited the lowest RMSE, its other metrics were inferior to models employing transformed data. Once more, the ARIMA model demonstrated the lowest AIC, AICc, and BIC values. Consequently, the ARIMA model was selected for forecasting May 2010. Here is the report of our ARIMA model.
+
+```{r}
+atm4_fit %>% select(.model = "ARIMA_ts") %>% report()
+```
+
+we can see that auto ARIMA from `fabletools` package picked ARIMA(0,0,1)(2,0,0) with mean. We can go ahead produced forecast for the month of May.
+
+##### **Forecasting:**
+
+```{r}
+fc_atm4 <- atm4_fit %>%
+  forecast(h = 31) %>%
+  filter(.model=='ARIMA_ts')
+```
+
+Here is the plot of our forecast for the month of May.
+
+```{r}
+fc_atm4 %>%
+  autoplot(atm_ts) +
+  ggtitle(latex2exp::TeX(paste0("ATM 4 Forcasted with $ARIMA(0,0,1)(2,0,0)_7$ and $\\lambda$ = ",
+         round(lambda4,2))))
+```
+
+Let's check out the residuals of our model.
+
+```{r}
+atm4_fit %>%
+  select(ARIMA_ts) %>%
+  gg_tsresiduals() +
+  ggtitle(latex2exp::TeX(paste0("Residuals for $ARIMA(0,0,1)(2,0,0)_7$ with $\\lambda$ = ",
+         round(lambda4,2))))
+```
+
+WE cans see that the residuals are almost normally distributed while ACF plots shows only one significant spike
+
+### **Forecasted Data:**
+
+Here are the ultimate forecasts for all four ATMs. ATM1 and ATM2 effectively capture the seasonality and its fluctuations. ATM3 simply reflects the average of non-zero data points. Meanwhile, ATM4 appears to regress towards the mean as we progress further into May.
+
+```{r}
+# save as data frame
+fc <- bind_rows(fc_atm1, fc_atm2, fc_atm3, fc_atm4) %>%
+  as.data.frame() %>%
+  select(Date, ATM, .mean) %>%
+  rename(Cash = .mean)
+
+# export file
+fc %>% write.csv("ATM_forecasts.csv")
+```
+
+Let's put all the forecast plots together.
+
+```{r}
+fc %>%
+  as_tsibble(index = Date, key = ATM) %>%
+  autoplot(Cash) +
+  facet_wrap(~ATM, scales = "free", nrow = 4) +
+  labs(title = "Forecasted ATM Withdrawls in May 2010")
+
+# altogether plot
+fc %>%
+  as_tsibble(index = Date, key = ATM) %>%
+  autoplot(Cash) +
+  autolayer(atm_ts, Cash, colour = "black") +
+  facet_wrap(~ATM, scales = "free", nrow = 4) +
+  labs(title = "ATM Withdrawls")
+```
+
+## **Residential Power Forecast:**
+
+In the section we will work with a simple dataset of residential power usage for January 1998 until December 2013. Our goal is to model these data and a monthly forecast for 2014. The data is given in a single file. The variable ‘KWH’ is power consumption in Kilowatt hours, the rest is straight forward. Let's load the data set.
+
+### **Loading the Dataset:**
+
+The dataset has been stored on a remote location and read into Rstudio from theere.
+
+```{r}
+res <- read.csv("https://raw.githubusercontent.com/Umerfarooq122/Multiple-forecasting-techniques-/main/residential%20%20-%20ResidentialCustomerForecastLoad.csv")
+head(res)
+```
+
+We can see that the month is in Character(text) data type so month was transformed from textual format into a monthly time object. Subsequently, the data was converted into a tsibble object.
+
+```{r}
+Res_Load <- res %>%
+  # renaming column name
+  rename(Month = 'YYYY.MMM') %>%
+  # converting into date format
+  mutate(Month = yearmonth(Month)) %>%
+  # converting to tsibble
+  as_tsibble(index = Month) 
+
+```
+
+Let's check out if we have any missing values in our data set.
+
+```{r}
+colSums(is.na(Res_Load))
+```
+
+We can confirm that there is only 1 missing value. Again we can interpolate for that using ARIMA
+
+### **Handling The Missing Values:**
+
+```{r}
+ts_data <- ts(Res_Load$KWH, frequency = 1)
+
+# Fit ARIMA model to the data
+arima_model <- auto.arima(ts_data)
+
+# Forecast missing values using the ARIMA model
+interpolated_data <- forecast(arima_model, h = length(ts_data))
+
+# Extract the interpolated values
+interpolated_values <- interpolated_data$mean
+
+# Replace missing values in the original data with the interpolated values
+Res_Load$KWH[is.na(Res_Load$KWH)] <- interpolated_values[is.na(Res_Load$KWH)]
+```
+
+
+### **Exploring the Dataset:**
+
+Let's have a quick look at the time series
+
+```{r}
+Res_Load %>%
+  autoplot(KWH) +
+  labs(title = "Residential Power Usage")
+```
+
+Upon initial inspection, the data appears to exhibit seasonality alongside a subtle upward trend. Additionally, there is an outlier in July 2010, with a value of 770523. This anomaly is likely attributable to a data entry error, possibly missing a digit. The recommended course of action is to rectify this outlier by removing it and employing interpolation.
+
+```{r}
+Res_miss <- Res_Load %>%
+  #replace outliers with NA
+  mutate(KWH = replace(KWH, KWH == 770523, NA)) 
+```
+
+```{r}
+Res_Load <- Res_miss %>%
+  # Fit ARIMA model to the data with missing values
+  model(ARIMA(KWH)) %>%
+  # Estimate Cash for the missing values / outliers
+  interpolate(Res_miss)
+```
+
+
+```{r}
+Res_Load %>%
+  autoplot(KWH) +
+  ggtitle("Residential Power Usage with no Outlier")
+
+# STL decomposition
+Res_Load %>%
+  model(STL(KWH ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition with no Outlier")
+```
+
+After removing the outlier, the graph becomes clearer and more coherent. An evident increasing trend emerges, exhibiting the least variation compared to other factors. Moreover, annual seasonality is observable, characterized by peaks during the summer and winter months. The remaining pattern appears random, with a notable spike observed in December 2013.
+
+
+```{r}
+Res_Load %>%
+  gg_season(KWH, labels = "both") +
+  labs(title = "Seasonal plot: Residential Power Usage")
+
+Res_Load %>%
+  gg_subseries(KWH) +
+  labs(title = "Residential Power Usage")
+```
+
+The seasonal plot provides additional insight, illustrating a consistent rise in power usage every summer and winter. Notably, there's a discernible upward trend in power consumption during peak months. It's likely that the variation in off-peak months is influenced by annual weather patterns. We can further go ahead and find lambda and create our models for transformed and non transformed time series.
+
+### **Modeling:**
+
+```{r}
+lambdaR <- Res_Load %>%
+  features(KWH, features = guerrero) %>%
+  pull(lambda_guerrero)
+```
+
+```{r}
+res_fit <- Res_Load %>%
+  model(
+    # additive ETS model
+    additive = ETS(KWH ~ error("A") + trend("A") + season("A")),
+    # multiplicative ETS model
+    multiplicative = ETS(KWH ~ error("M") + trend("A") + season("M")),
+    # additive damped model
+    damped = ETS(KWH ~ error("A") + trend("Ad") + season("A")),
+    # SNAIVE model
+    snaive = SNAIVE(KWH),
+    # transformed additive ETS model
+    additive_bc = ETS(box_cox(KWH,lambdaR) ~ error("A") + trend("A") + season("A")),
+    # transformed multiplicative ETS model
+    multiplicative_bc = ETS(box_cox(KWH,lambdaR) ~ error("M") + trend("A") + season("M")),
+    # transformed additive damped model
+    damped_bc = ETS(box_cox(KWH,lambdaR) ~ error("A") + trend("Ad") + season("A")),
+    # transformed SNAIVE model
+    snaive_bc = SNAIVE(box_cox(KWH,lambdaR)),
+    # arima model
+    ARIMA_ts = ARIMA(box_cox(KWH,lambdaR)),
+    ARIMA = ARIMA(KWH)
+  )
+```
+
+```{r warning=FALSE, message=FALSE}
+# stats for the models
+left_join(glance(res_fit) %>% select(.model:BIC), 
+          accuracy(res_fit) %>% select(.model, RMSE)) %>%
+  arrange(AICc)
+```
+
+In contrast to the other datasets, this particular one yielded negative values for AICc, AIC, and BIC. Although the additive exponential smoothing with a Box-Cox transformation exhibited the lowest RMSE, the ARIMA model outperformed in terms of AIC, AICc, and BIC. Hence, selecting the ARIMA model is the optimal choice. Now we can go ahead and produced forecast using ARIMA with transformed time series.
+
+### **Forecasting:**
+
+```{r}
+fc_res <- res_fit %>%
+  forecast(h = 12) %>%
+  filter(.model=='ARIMA_ts')
+
+fc_res %>%
+  autoplot(Res_Load) +
+  ggtitle(latex2exp::TeX(paste0("ATM 1 Forcasted with $(0,0,1)(2,1,0)_{12}$ and $\\lambda$ = ",
+         round(lambda,2))))
+
+res_fit %>%
+  select(ARIMA) %>%
+  gg_tsresiduals(lag = 24) +
+  ggtitle(latex2exp::TeX(paste0("Residuals for $(0,0,1)(2,1,0)_{12}$ with $\\lambda$ = ",
+         round(lambda,2))))
+
+res_fit %>% 
+  select(.model = "ARIMA") %>%
+  augment() %>% 
+  features(.innov, box_pierce, lag = 24, dof = 0)
+```
+
+
+The residuals appear to exhibit characteristics of white noise, as indicated by both the graphs and the results of the Box-Pierce test. Notably, it's intriguing to observe that the initial few residuals appear to remain constant.
+
+Here are the final forecasted data using the ARIMA model:
+
+```{r}
+fc_res <- fc_res %>%
+  as.data.frame() %>%
+  select(Month, .mean) %>%
+  rename(KWH = .mean) %>%
+  mutate(CaseSequence = 925:936) %>%
+  relocate(CaseSequence)
+fc_res
+```
+
+```{r}
+fc_res %>% write.csv("Res_forecasts.csv")
+```
+
+## **Water Flow Forecast (BONUS):**
+
+### **Introduction:** 
+
+In this section we have two datasets. These are simple 2 columns sets, however they have different time stamps.  Our goal is to time-base sequence the data and aggregate based on hour (example of what this looks like, follows).  Note for multiple recordings within an hour, take the mean.  Then to determine if the data is stationary and can it be forecast.  If so, provide a week forward forecast and present results via Rpubs and .rmd and the forecast in an Excel readable file.   
+
+
+#### **Pipe 1:**
+
+In this section we will look at the pipe 1 flow.
+
+##### **Loading the Dataset:**
+
+```{r warning=FALSE}
+# reading in excel file
+temp <- read_excel("Waterflow_Pipe1.xlsx", col_types = c('date', 'numeric')) %>%
+  mutate(`Date Time` = as_datetime(`Date Time`)) %>%
+  rename(DateTime = `Date Time`) %>%
+  mutate(date = as.Date(DateTime),
+         hour = paste(format(DateTime, format = "%H"),":00:00"))
+
+Pipe1 <- temp %>%
+  mutate(DateTime = ymd(date) + hms(hour)) %>%
+  group_by(DateTime) %>%
+  mutate(WaterFlow = mean(WaterFlow)) %>%
+  distinct(DateTime, WaterFlow) %>%
+  as_tsibble(index = DateTime)
+ 
+head(Pipe1)
+```
+
+
+The 'Date Time' column underwent transformation due to its representation as a 5-digit numeric type, which can be interpreted with 00000 corresponding to 1/1/1900. Pipe1 comprises multiple entries per hour, thus necessitating the calculation of hourly averages. Subsequently, the dataset was converted into a tsibble object.
+
+##### **Handling Missing Values:**
+
+```{r}
+
+Pipe1 <- fill_gaps(Pipe1)
+
+miss <- Pipe1 %>%
+  filter(is.na(WaterFlow))
+miss
+```
+
+```{r}
+temp <- temp %>%
+  select(DateTime, WaterFlow) %>%
+  rbind(.,miss) %>%
+  as_tsibble(index = DateTime) %>%
+  na_interpolation(.)
+
+
+Pipe1 <-left_join(Pipe1, temp, by = "DateTime") %>%
+  mutate(WaterFlow  = coalesce(WaterFlow.x, WaterFlow.y)) %>%
+  select(DateTime, WaterFlow)
+```
+
+##### **Exploring the Dataset:**
+
+```{r}
+Pipe1 %>%
+  gg_tsdisplay(WaterFlow, plot_type='partial') +
+  labs(title = "Water Flow of Pipe 1")
+```
+
+```{r}
+Pipe1 %>%
+  features(WaterFlow, unitroot_kpss)
+```
+
+```{r}
+Pipe1 %>%
+  model(STL(WaterFlow ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition")
+```
+
+##### **Modeling:**
+
+```{r}
+
+lambda <- Pipe1 %>%
+  features(WaterFlow, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+p1_fit <- Pipe1 %>%
+  model(
+    ARIMA_bc = ARIMA(box_cox(WaterFlow,lambda)),
+    ARIMA = ARIMA(WaterFlow)
+  )
+
+glance(p1_fit) %>% arrange(AICc) %>% select(.model:BIC)
+```
+
+```{r}
+p1_fit %>% select(.model = "ARIMA_bc") %>% report()
+```
+
+##### **Forcasting:**
+
+```{r}
+
+p1_fc <-p1_fit %>%
+  forecast(h = 168) %>%
+  filter(.model=='ARIMA_bc')
+
+
+p1_fc %>%
+  autoplot(Pipe1) +
+  ggtitle(latex2exp::TeX(paste0("Pipe 1 Forecasted with ARIMA $(0,0,0)$ with mean and $\\lambda$ = ",
+         round(lambda,2))))
+
+
+p1_fit %>%
+  select(ARIMA) %>%
+  gg_tsresiduals() +
+  ggtitle("Residuals for Pipe 1 | ARIMA(0,0,0) with mean")
+```
+
+The ARIMA model is just the mean of the data. The residuals appear to be white noise
+
+#### **Pipe 2:**
+
+##### **Loading the Dataset:**
+
+```{r warning=FALSE}
+# reading in excel file
+Pipe2 <- read_excel("Waterflow_Pipe2.xlsx", col_types = c('date', 'numeric')) %>%
+  # converting into date format
+  mutate(`Date Time` = as_datetime(`Date Time`)) %>%
+  # renaming column name
+  rename(DateTime = `Date Time`) %>%
+  # converting to tsibble
+  as_tsibble(index = DateTime) 
+
+head(Pipe2)
+```
+
+The dates were converted for Pipe2 and the data was converted to a tsibble. There are no missing data nor hours. Let's confirm the missing values from summary
+
+```{r}
+summary(Pipe2)
+```
+
+##### **Exploring the Dataset:**
+
+
+Let's explore our dataset
+
+```{r}
+Pipe2 %>%
+  gg_tsdisplay(WaterFlow, plot_type='partial') +
+  labs(title = "Water Flow of Pipe 2")
+```
+
+```{r}
+Pipe2 %>%
+  model(STL(WaterFlow ~ season(window = "periodic"), robust = TRUE)) %>%
+  components() %>%
+  autoplot() +
+  labs(title = "STL Decomposition")
+```
+
+Looking at the STL decomposition, there seems to be some seasonality on a daily basis, as well as weekly.
+
+##### **Modeling:**
+
+```{r}
+# lambda for box cox transformation
+lambda <- Pipe2 %>%
+  features(WaterFlow, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+p2_fit <- Pipe2 %>%
+  model(
+    # arima model
+    ARIMA_bc = ARIMA(box_cox(WaterFlow,lambda)),
+    ARIMA = ARIMA(WaterFlow)
+  )
+
+glance(p2_fit) %>% arrange(AICc) %>% select(.model:BIC)
+```
+
+The data is transformed using box-cox. The ARIMA model without the box-cox transformation has lower statistics(AICc,AIC and BIC), meaning it is the better model.
+
+```{r}
+p2_fit %>% 
+  select(.model = "ARIMA_bc") %>% report()
+```
+
+##### **Forecasting:**
+
+```{r}
+# forecasting the data
+p2_fc <-p2_fit %>%
+  forecast(h = 168) %>%
+  filter(.model=='ARIMA')
+
+# forecasted plot
+p2_fc %>%
+  autoplot(Pipe2) +
+  ggtitle(latex2exp::TeX(paste0("Pipe 2 Forecasted with ARIMA $(0,0,0)$ with mean and $\\lambda$ = ",
+         round(lambda,2))))
+
+# residual plot
+p2_fit %>%
+  select(ARIMA) %>%
+  gg_tsresiduals() +
+  ggtitle("Residuals for Pipe 1 | ARIMA(0,0,0) with mean")
+```
+
+With a large h in our forecast, the forecasts eventually become mean of the data. The residuals appear to be white noise.
+
+### Final Results:
+
+```{r}
+p1_fc <- p1_fc %>%
+  as.data.frame() %>%
+  select(DateTime, .mean) %>%
+  rename(WaterFlow = .mean)
+
+p2_fc <- p2_fc %>%
+  as.data.frame() %>%
+  select(DateTime, .mean) %>%
+  rename(WaterFlow = .mean)
+
+# export file
+
+#write.xlsx(list('Pipe1' = p1_fc, 'Pipe2' = p2_fc), file = 'pipes.xlsx')
+```
+
+
+
+
